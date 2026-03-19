@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>个人博客 · 动态光影背景</title>
+  <!-- 原有博客字体 (Inter) + 可能用到的Montserrat (但以Inter为主) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600&display=swap" rel="stylesheet">
+  <!-- 为了安全，也加载Montserrat (但默认用Inter) -->
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    /* ----- 全局重置 & 基础 ----- */
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body, html, #app {
+      margin: 0;
+      width: 100%;
+      min-height: 100vh;
+      /* 移除之前渐变背景，交给canvas */
+      background: transparent;
+    }
+
+    body {
+      font-family: 'Inter', 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif;
+      line-height: 1.6;
+      color: #1e1e2f;
+      touch-action: auto;  /* 允许默认滚动/触摸，canvas内部不干扰 */
+      overflow-x: hidden;
+    }
+
+    /* ----- 固定背景画布 (Three.js) ----- */
+    #canvas {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: 0;
+      pointer-events: none;  /* 让鼠标事件穿透画布，点击博客内容不受影响 */
+      display: block;
+    }
+
+    /* 为了让画布不拦截点击，但点击画布本身不需要交互，pointer-events: none 即可 */
+    /* 不过管子动画需要鼠标移动来产生效果，如果pointer-events:none，光标移动事件还能触发吗？
+       实际上threejs-components内部会监听mousemove，需要事件能到达canvas。
+       但如果canvas是pointer-events:none，则鼠标事件会被下面的元素接收，canvas收不到。
+       所以不能设置为none，而应该让canvas覆盖在上层但事件穿透？矛盾。
+       解决方案：canvas正常接收事件，但内容区域需要放置在canvas上方且可点击，可以通过z-index和事件穿透实现。
+       通常做法：canvas位于底层，内容在上层，canvas可以捕获鼠标事件（因为它在底层，但鼠标在内容上时内容捕获，在空白区域时canvas捕获）。
+       但canvas需要全屏捕获鼠标移动来驱动管子，所以必须让canvas能够接收到mousemove，无论鼠标在哪里。
+       因此不能使用pointer-events:none。我们需要将canvas置于底层（z-index低），内容置于上层（z-index高），但canvas仍然在底层，鼠标事件会先被上层内容捕获，如果上层内容不消费事件（比如空白区域），事件会穿透到canvas吗？默认情况下，如果上层元素不消费事件（例如背景透明且没有子元素拦截），事件会穿透到下层。但上层元素如果有背景（哪怕透明）也会拦截事件？实际上，元素是否拦截事件取决于是否设置了pointer-events。默认情况下，元素只要有区域（哪怕背景透明）就会捕获事件，不会自动穿透。因此，我们需要让内容区域在不需要交互的地方允许事件穿透到canvas，但文章卡片等需要点击的地方则正常捕获。
+       更好的方案：将canvas设置为fixed全屏，z-index低；内容区域设置更高的z-index，并且内容区域中的元素正常接收事件。但内容区域作为一个整体（比如.wrapper）会覆盖整个区域，导致canvas永远收不到事件，因为.wrapper占满宽度并可能高度超过视口。所以我们需要让.wrapper不拦截事件，而只让其中的卡片、链接等拦截事件。
+       可以通过给.wrapper设置pointer-events: none，然后给所有需要交互的子元素设置pointer-events: auto来实现。
+       这样，鼠标在空白区域就会穿过.wrapper到达canvas，canvas就能收到mousemove；当鼠标移到卡片或链接上，交互正常。
+       这是常用技巧。
+    */
+    #canvas {
+      z-index: 0;
+      pointer-events: auto; /* 默认可以接收事件，但会被上层覆盖，通过上层控制穿透 */
+    }
+
+    /* 内容容器：不拦截事件，让事件穿透到canvas，但内部交互元素恢复 */
+    .content-wrapper {
+      position: relative;
+      z-index: 10;
+      min-height: 100vh;
+      width: 100%;
+      pointer-events: none;  /* 让空白区域穿透 */
+    }
+
+    /* 所有需要点击/交互的元素恢复事件 */
+    .content-wrapper a,
+    .content-wrapper button,
+    .content-wrapper .post-card,
+    .content-wrapper .avatar,
+    .content-wrapper .nav-links a,
+    .content-wrapper .social-links a,
+    .content-wrapper .read-more,
+    .content-wrapper .post-title a,
+    .content-wrapper .post-meta span /* 如果想让标签也可点击？暂时不需要 */ {
+      pointer-events: auto;
+    }
+
+    /* 原有博客样式 — 适配透明背景，微调半透明度以保证可读性 */
+    .wrapper {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 2.5rem 1.8rem;
+      display: flex;
+      flex-direction: column;
+      /* 移除背景模糊，因为底层是canvas，再用模糊会叠加效果可能混乱，保留半透明卡片即可 */
+    }
+
+    /* 头部区域 */
+    .blog-header {
+      text-align: center;
+      margin-bottom: 3.5rem;
+      padding: 1rem 0;
+    }
+
+    .avatar {
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      object-fit: cover;
+      background: rgba(255, 255, 255, 0.7);
+      box-shadow: 0 10px 25px -8px rgba(0, 0, 0, 0.2);
+      border: 3px solid rgba(255, 255, 255, 0.8);
+      margin-bottom: 1.2rem;
+      transition: transform 0.3s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2.5rem;
+      color: #2a2a40;
+    }
+
+    .avatar:hover {
+      transform: scale(1.02);
+    }
+
+    .blog-title {
+      font-size: 2.8rem;
+      font-weight: 500;
+      letter-spacing: -0.5px;
+      color: #ffffff;  /* 改为白色，因为背景变暗/亮不确定，但带阴影保证可读 */
+      text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+      margin-bottom: 0.25rem;
+    }
+
+    .blog-subtitle {
+      font-size: 1.2rem;
+      font-weight: 300;
+      color: #f0f0f0;
+      text-shadow: 0 2px 8px rgba(0,0,0,0.5);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.3);
+      display: inline-block;
+      padding-bottom: 0.4rem;
+      margin-top: 0.2rem;
+    }
+
+    /* 导航栏 — 半透明白色胶囊 */
+    .nav-links {
+      display: flex;
+      justify-content: center;
+      gap: 2rem;
+      margin: 2rem 0 1rem 0;
+      flex-wrap: wrap;
+    }
+
+    .nav-links a {
+      text-decoration: none;
+      color: #fff;
+      font-weight: 500;
+      padding: 0.4rem 1rem;
+      border-radius: 40px;
+      background: rgba(20, 20, 30, 0.4);
+      backdrop-filter: blur(6px);
+      transition: all 0.2s ease;
+      font-size: 1.05rem;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    }
+
+    .nav-links a:hover {
+      background: rgba(255, 255, 255, 0.25);
+      border-color: rgba(255, 255, 255, 0.7);
+      transform: translateY(-2px);
+    }
+
+    /* 博客文章列表 */
+    .posts-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2.2rem;
+      margin-top: 1.5rem;
+      flex: 1;
+    }
+
+    .post-card {
+      background: rgba(20, 20, 35, 0.5);  /* 深色半透明，与亮色管状背景对比 */
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-radius: 28px;
+      padding: 1.8rem 2.2rem;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      box-shadow: 0 20px 40px -12px rgba(0, 0, 0, 0.3);
+      transition: background 0.3s, box-shadow 0.3s, transform 0.2s;
+      color: #f0f0f0;
+    }
+
+    .post-card:hover {
+      background: rgba(30, 30, 45, 0.7);
+      box-shadow: 0 25px 45px -12px #00000055;
+      transform: scale(1.01);
+    }
+
+    .post-meta {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      font-size: 0.9rem;
+      color: #cccce0;
+      margin-bottom: 0.6rem;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .post-date, .post-tag {
+      background: rgba(255, 255, 255, 0.15);
+      padding: 0.2rem 1rem;
+      border-radius: 30px;
+      font-weight: 400;
+      border: 1px solid rgba(255,255,255,0.2);
+      backdrop-filter: blur(4px);
+    }
+
+    .post-title {
+      font-size: 1.9rem;
+      font-weight: 480;
+      letter-spacing: -0.3px;
+      line-height: 1.3;
+      margin: 0.5rem 0 0.8rem 0;
+      color: #ffffff;
+      text-shadow: 0 2px 5px black;
+    }
+
+    .post-title a {
+      text-decoration: none;
+      color: inherit;
+    }
+
+    .post-title a:hover {
+      color: #c0c0ff;
+    }
+
+    .post-excerpt {
+      color: #e0e0f0;
+      font-size: 1.05rem;
+      margin-bottom: 1rem;
+      opacity: 0.9;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    }
+
+    .read-more {
+      display: inline-flex;
+      align-items: center;
+      font-weight: 470;
+      color: #ffffff;
+      text-decoration: none;
+      border-bottom: 2px solid rgba(255, 255, 255, 0.4);
+      padding-bottom: 2px;
+      transition: border-color 0.2s, color 0.2s;
+    }
+
+    .read-more:hover {
+      color: #ffffff;
+      border-bottom-color: #ffffff;
+    }
+
+    .read-more::after {
+      content: " →";
+      font-size: 1.2rem;
+      line-height: 1;
+      margin-left: 4px;
+      transition: transform 0.2s;
+    }
+
+    .read-more:hover::after {
+      transform: translateX(4px);
+    }
+
+    /* 页脚 */
+    .blog-footer {
+      margin-top: 3.5rem;
+      text-align: center;
+      color: #f0f0f0;
+      text-shadow: 0 2px 6px black;
+      font-size: 0.95rem;
+      padding: 1.5rem 0 0.5rem 0;
+      border-top: 1px solid rgba(255, 255, 255, 0.2);
+      backdrop-filter: blur(4px);
+    }
+
+    .social-links {
+      display: flex;
+      justify-content: center;
+      gap: 2rem;
+      margin-bottom: 1.2rem;
+    }
+
+    .social-links a {
+      color: white;
+      text-decoration: none;
+      font-size: 1rem;
+      border-radius: 30px;
+      background: rgba(0, 0, 0, 0.3);
+      backdrop-filter: blur(6px);
+      padding: 0.3rem 1.5rem;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      transition: all 0.2s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .social-links a:hover {
+      background: rgba(255, 255, 255, 0.25);
+      border-color: white;
+    }
+
+    /* 响应式 */
+    @media (max-width: 550px) {
+      .wrapper {
+        padding: 1.8rem 1.2rem;
+      }
+      .blog-title {
+        font-size: 2.2rem;
+      }
+      .post-card {
+        padding: 1.5rem 1.5rem;
+      }
+      .post-title {
+        font-size: 1.6rem;
+      }
+      .nav-links {
+        gap: 1rem;
+      }
+    }
+
+    /* 隐藏原来的.hero示例，我们用博客内容 */
+    /* 确保canvas和内容正确叠加 */
+    #app {
+      position: relative;
+      width: 100%;
+      min-height: 100vh;
+      background: transparent;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <!-- 背景画布: 由Three.js驱动 -->
+    <canvas id="canvas"></canvas>
+
+    <!-- 博客内容层 (事件穿透，但内部链接等可点击) -->
+    <div class="content-wrapper">
+      <div class="wrapper">
+        <header class="blog-header">
+          <div class="avatar" style="background: #2a2a4a; color: white;">✎</div>
+          <h1 class="blog-title">沈本五羊散记</h1>
+          <div class="blog-subtitle">冲刺 · 滑铲 · 雄鹿</div>
+          <nav class="nav-links">
+            <a href="#">瓦</a>
+            <a href="#">罗</a>
+            <a href="#">兰</a>
+            <a href="#">特</a>
+          </nav>
+        </header>
+
+        <main class="posts-list">
+          <!-- 文章 1 -->
+      <article class="post-card">
+        <div class="post-meta">
+          <span class="post-date">2026年3月12日</span>
+          <span class="post-tag">文章</span>
+        </div>
+        <h2 class="post-title"><a href="#">打瓦日记</a></h2>
+        <p class="post-excerpt">
+          霓虹是cs英雄！
+        </p>
+        <a href="#" class="read-more">阅读全文</a>
+      </article>
+
+        
+
+        <footer class="blog-footer">
+          <div class="social-links">
+            <a href="#" aria-label="GitHub">GitHub</a>
+            <a href="#" aria-label="Twitter">Twitter</a>
+            <a href="#" aria-label="RSS">RSS</a>
+          </div>
+          <p>© 2025 静墨散记 · 光影背景版</p>
+          <p style="font-size:0.85rem; margin-top:0.5rem; opacity:0.8;">✶ 点击任意位置变换管子色彩 ✶</p>
+        </footer>
+      </div>
+    </div>
+  </div>
+
+  <!-- 引入Three.js tubes cursor组件 -->
+  <script type="module">
+    // 许可证: CC BY-NC-SA 4.0
+    import TubesCursor from "https://cdn.jsdelivr.net/npm/threejs-components@0.0.19/build/cursors/tubes1.min.js";
+
+    // 初始化画布背景
+    const canvas = document.getElementById('canvas');
+    const app = TubesCursor(canvas, {
+      tubes: {
+        colors: ["#f967fb", "#53bc28", "#6958d5"],
+        lights: {
+          intensity: 200,
+          colors: ["#83f36e", "#fe8a2e", "#ff008a", "#60aed5"]
+        }
+      }
+    });
+
+    // 点击随机变色 (不影响链接跳转，因为事件冒泡)
+    document.body.addEventListener('click', (e) => {
+      // 避免点击链接时也触发？实际上点击链接会跳转，但颜色改变也发生，无伤大雅
+      const colors = randomColors(3);
+      const lightsColors = randomColors(4);
+      console.log('新颜色:', colors, lightsColors);
+      app.tubes.setColors(colors);
+      app.tubes.setLightsColors(lightsColors);
+    });
+
+    function randomColors(count) {
+      return new Array(count)
+        .fill(0)
+        .map(() => "#" + Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0'));
+    }
+
+    // 小优化：如果canvas因为pointer-events穿透设置而无法捕获鼠标，我们通过上层事件代理？
+    // 实际上我们保留了canvas的pointer-events:auto，但上层.content-wrapper有pointer-events:none，事件会穿透到canvas，
+    // 所以canvas可以接收到mousemove。并且卡片区域因为设置了pointer-events:auto，事件会被卡片捕获，不会穿透，但卡片区域较小，
+    // 鼠标在卡片上移动时，卡片接收事件，canvas收不到，但管子动画依赖的mousemove是全局的，只要鼠标移出卡片就能触发canvas。
+    // 这可能导致在卡片上移动时光标效果暂停。这是可接受的，因为大多数背景动画在交互元素上暂停影响不大。
+    // 如果想完美，可以用js将mousemove手动传递给canvas，但复杂度高，这样也足够。
+  </script>
+</body>
+</html>
